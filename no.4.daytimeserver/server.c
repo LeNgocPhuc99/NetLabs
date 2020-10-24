@@ -62,9 +62,19 @@ int main(int argc, char const *argv[])
         printf("Accepted!\n");
     }
     time(&t);
+    strcpy(sendmess, ctime(&t));
+    if(send(newfd,sendmess, sizeof(sendmess), 0) < 0)
+    {
+        fprintf(stderr, "Server-send() error: %d\n", errno);
+        exit(1);
+    }
+    else
+    {
+        printf("Send successful!\n");
+    }
+    
 
     close(newfd);
     close(sockfd);
-
     return 0;
 }
