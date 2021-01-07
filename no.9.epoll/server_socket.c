@@ -2,22 +2,20 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <netdb.h>
 #include <errno.h>
 #include <sys/epoll.h>
+#include <netdb.h>
 
-#include "epoll_interface.h"
 #include "network.h"
-#include "client_socket.h"
+#include "epoll_interface.h"
 #include "server_socket.h"
+#include "client_socket.h"
+#include "backend_socket.h"
 
-
-
-#define MAX_LISTEN_BACKLOG 100
-
+#define MAX_LISTEN_BACKLOG 4096
 
 // info of incoming connection 
-struct server_socket_event_data
+struct server_socket_event_data 
 {
     int epoll_fd;
     char* backend_addr;
@@ -25,47 +23,114 @@ struct server_socket_event_data
 };
 
 
-
-void handle_client_connection(int epoll_fd, int client_socket_fd, char* backend_addr, char* backend_port)
+int connect_to_backend(char* backend_host, char* backend_port)
 {
-    struct epoll_event_handler* client_socket_event_handler;
-    client_socket_event_handler = create_client_socket_handler(client_socket_fd, epoll_fd, backend_addr, backend_port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
 
-    epoll_add_handler(epoll_fd, client_socket_event_handler, EPOLLIN | EPOLLRDHUP);
-    
-    //printf("add handle connect\n");
+    int getaddrinfo_error;
+    struct addrinfo* addrs;
+    getaddrinfo_error = getaddrinfo(backend_host, backend_port, &hints, &addrs);
+    if (getaddrinfo_error != 0) 
+    {
+        if (getaddrinfo_error == EAI_SYSTEM) 
+        {
+            fprintf(stderr, "Couldn't find backend: system error: %s\n", strerror(errno));
+        } 
+        else 
+        {
+            fprintf(stderr, "Couldn't find backend: %s\n", gai_strerror(getaddrinfo_error));
+        }
+        exit(1);
+    }
+
+    int backend_socket_fd;
+    struct addrinfo* addrs_iter;
+    for (addrs_iter = addrs; addrs_iter != NULL; addrs_iter = addrs_iter->ai_next)
+    {
+        backend_socket_fd = socket(addrs_iter->ai_family, addrs_iter->ai_socktype, addrs_iter->ai_protocol);
+        if (backend_socket_fd == -1) 
+        {
+            continue;
+        }
+
+        if (connect(backend_socket_fd, addrs_iter->ai_addr, addrs_iter->ai_addrlen) != -1)
+        {
+            break;
+        }
+
+        close(backend_socket_fd);
+    }
+
+    if (addrs_iter == NULL) 
+    {
+        fprintf(stderr, "Couldn't connect to backend");
+        exit(1);
+    }
+
+    freeaddrinfo(addrs);
+
+    return backend_socket_fd;
 }
+
+
+
+void handle_client_connection(int epoll_fd, int client_socket_fd, char* backend_host, char* backend_port) 
+{
+
+    struct epoll_event_handler* client_socket_event_handler;
+    client_socket_event_handler = create_client_socket_handler(client_socket_fd, epoll_fd, backend_host);
+
+    // connect to backend server
+    struct epoll_event_handler* backend_socket_event_handler;
+    int backend_socket_fd = connect_to_backend(backend_host, backend_port);
+    backend_socket_event_handler = create_backend_socket_handler(epoll_fd, backend_socket_fd);
+
+    struct client_socket_event_data* client_closure = (struct client_socket_event_data*) client_socket_event_handler->closure;
+    client_closure->backend_handler = backend_socket_event_handler;
+
+    // add client_handler
+
+    struct backend_socket_event_data* backend_closure = (struct backend_socket_event_data*) backend_socket_event_handler->closure;
+    backend_closure->client_handler = client_socket_event_handler;
+
+
+}
+
 
 // accept clinet connect && handle
 void handle_server_socket_event(struct epoll_event_handler* self, uint32_t events)
 {
     struct server_socket_event_data* closure = (struct server_socket_event_data*) self->closure;
-    
+
     int client_socket_fd;
-    while (1)
+    while (1) 
     {
-        client_socket_fd = accept(self->fd,NULL, NULL);
-        if(client_socket_fd == -1)
+        client_socket_fd = accept(self->fd, NULL, NULL);
+        if (client_socket_fd == -1) 
         {
-            if(errno == EAGAIN || errno == EWOULDBLOCK) 
+            if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) 
             {
                 break;
-            }
-            else
+            } 
+            else 
             {
-                perror("Couldn't accept\n");
+                perror("Could not accept");
                 exit(1);
             }
-            
         }
+
         handle_client_connection(closure->epoll_fd, client_socket_fd, closure->backend_addr, closure->backend_port);
     }
 }
 
+
 int create_and_bind(char* server_port)
 {
     struct addrinfo hints;
-    bzero(&hints, sizeof(struct addrinfo));
+    memset(&hints, 0, sizeof(struct addrinfo));
     // IPv4 && IPv6
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -74,50 +139,52 @@ int create_and_bind(char* server_port)
     struct addrinfo* addrs;
     int getaddrinfo_error;
     getaddrinfo_error = getaddrinfo(NULL, server_port, &hints, &addrs);
-    if(getaddrinfo_error != 0)
+    if (getaddrinfo_error != 0) 
     {
-        perror("getaddrinfo() error!\n");
+        fprintf(stderr, "Couldn't find local host details: %s\n", gai_strerror(getaddrinfo_error));
         exit(1);
     }
 
     int server_socket_fd;
     struct addrinfo* addr_iter;
-    
-    for(addr_iter = addrs; addr_iter != NULL; addr_iter = addr_iter->ai_next)
+    for (addr_iter = addrs; addr_iter != NULL; addr_iter = addr_iter->ai_next) 
     {
+
         server_socket_fd = socket(addr_iter->ai_family, addr_iter->ai_socktype, addr_iter->ai_protocol);
-        if (server_socket_fd == -1)
-        {
-            continue;
-        }
-        
-        int so_reuseaddr = 1;
-        if(setsockopt(server_socket_fd, SOL_SOCKET, SO_REUSEADDR, &so_reuseaddr, sizeof(so_reuseaddr)) != 0)
+        if (server_socket_fd == -1) 
         {
             continue;
         }
 
-        if(bind(server_socket_fd, addr_iter->ai_addr, addr_iter->ai_addrlen) == 0)
+        int so_reuseaddr = 1;
+        if (setsockopt(server_socket_fd, SOL_SOCKET, SO_REUSEADDR, &so_reuseaddr, sizeof(so_reuseaddr)) != 0) 
+        {
+            continue;
+        }
+
+        if (bind(server_socket_fd, addr_iter->ai_addr, addr_iter->ai_addrlen) == 0)
         {
             break;
         }
+
         close(server_socket_fd);
     }
-    if (addr_iter == NULL)
+
+    if (addr_iter == NULL) 
     {
-        perror("Couldn't bind\n");
+        fprintf(stderr, "Couldn't bind\n");
         exit(1);
     }
-    freeaddrinfo(addrs);
 
+    freeaddrinfo(addrs);
 
     return server_socket_fd;
 }
 
 
-// listen for incoming connections
-struct epoll_event_handler* create_server_socket_handler(int epoll_fd, char* server_port, char* backend_addr, char* backend_port) 
+struct epoll_event_handler* create_server_socket_handler(int epoll_fd, char* server_port, char* backend_addr, char* backend_port)
 {
+
     int server_socket_fd;
     server_socket_fd = create_and_bind(server_port);
     make_socket_non_blocking(server_socket_fd);
@@ -129,21 +196,17 @@ struct epoll_event_handler* create_server_socket_handler(int epoll_fd, char* ser
     closure->backend_addr = backend_addr;
     closure->backend_port = backend_port;
 
+    // result: server socket handler: 
     struct epoll_event_handler* result = malloc(sizeof(struct epoll_event_handler));
     result->fd = server_socket_fd;
     result->handle = handle_server_socket_event;
     result->closure = closure;
 
-   // printf("create create_server_socket_handler success! \n");
+    // add epoll event
+    epoll_add_handler(epoll_fd, result, EPOLLIN | EPOLLET);
+
+
     return result;
 }
-
-
-
-
-
-
-
-
 
 
